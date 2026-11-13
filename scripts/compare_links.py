@@ -193,7 +193,10 @@ def plot_elpd(table: pd.DataFrame, reference: str, path: Path) -> None:
     ax.grid(axis="y", visible=False)
     ax.set_xlabel(f"ELPD (PSIS-LOO) minus the {reference} fit's; right of 0 predicts better")
     ax.set_title(f"Predictive accuracy of each link against {reference}")
-    ax.text(0, -0.32 if len(t) < 4 else -0.26, "Thick bar: ±1 SE of the paired difference; thin bar: ±2 SE.",
+    note = "Thick bar: ±1 SE of the paired difference; thin bar: ±2 SE."
+    if t["link"].str.endswith("*").any():
+        note += "\n* failed the sampling checks: indicative only."
+    ax.text(0, -0.36 if len(t) < 4 else -0.3, note, va="top",
             transform=ax.transAxes, fontsize=8, color=INK_SECONDARY)
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -316,6 +319,13 @@ def main():
         name, _, directory = spec.partition("=")
         print(f"Loading {name} from {directory}...")
         fits[name] = load_fit(Path(directory))
+    # Mark fits that fail a sampling check: their numbers are indicative only.
+    fits = {
+        name if all(passes(fit[c]) for c, (passes, _) in SAMPLING_CHECKS.items()) else f"{name}*": fit
+        for name, fit in fits.items()
+    }
+    if any(name.endswith("*") for name in fits):
+        print("* failed a sampling check; its draws do not describe the posterior reliably")
     reference = next(iter(fits))
     for name, fit in fits.items():
         same = fit["df"][["Model", "benchmark"]].equals(fits[reference]["df"][["Model", "benchmark"]])

@@ -673,7 +673,11 @@ def fit_bayesian_eci(
         random_seed=random_seed, progressbar=progressbar,
         dense_mass_matrix=dense_mass_matrix, sample_kwargs=sample_kwargs,
         pilot_model=(
-            build_bayesian_model(df, priors, performance_clip_eps, "logit", capability_bound)
+            # On the default box at most: PyMC's initial jitter is relative
+            # to the box, so a wide one scatters the chains too far to tune.
+            build_bayesian_model(
+                df, priors, performance_clip_eps, "logit", min(capability_bound, _CD_BOUND)
+            )
             if link == "stukel" else None
         ),
     )

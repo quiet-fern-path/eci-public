@@ -210,6 +210,10 @@ Heavier-tailed links spread capabilities much further on the raw scale, so the
 `--capability-bound`) widens it. The stukel link's pilot runs on the logistic
 model, which it nests, followed by a short dense warm-up run.
 
+On the published data the logistic link predicts best, and the stukel fit does
+not converge: its lower tail keeps fattening and the weakest models'
+capabilities run to whatever bound the prior sets, so treat it as experimental.
+
 `scripts/compare_links.py` compares fits saved with `--save-trace` by PSIS-LOO:
 the sampling checks, ELPD and its paired difference from a reference fit, and
 leave-one-out calibration plots.
