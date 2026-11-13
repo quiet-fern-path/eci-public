@@ -28,12 +28,14 @@ from matplotlib import ticker
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy import stats
 
+from .links import STUKEL_PARAM, link_mean
+
 # Parameters the diagnostics summarise. kappa and log_slope are left out:
 # each is a one-to-one transform of a parameter already listed (sigma, slope),
 # so its r_hat and ESS say nothing extra.
 REPORTED_VARS = (
     "capability", "difficulty", "slope", "sigma",
-    "tau_alpha", "sigma_median", "tau_sigma",
+    "tau_alpha", "sigma_median", "tau_sigma", STUKEL_PARAM,
 )
 
 # Coverage levels reported by the calibration check.
@@ -169,7 +171,13 @@ def _posterior_mu(trace: az.InferenceData, df: pd.DataFrame) -> np.ndarray:
     capability = _flatten(trace.posterior["capability"])[:, model_idx]
     difficulty = _flatten(trace.posterior["difficulty"])[:, bench_idx]
     slope = _flatten(trace.posterior["slope"])[:, bench_idx]
-    return 1.0 / (1.0 + np.exp(-slope * (capability - difficulty)))
+    eta = slope * (capability - difficulty)
+    # Traces saved before links were configurable carry no attribute.
+    link = trace.posterior.attrs.get("link", "logit")
+    if link != "stukel":
+        return link_mean(link, eta)
+    alpha = _flatten(trace.posterior[STUKEL_PARAM])
+    return link_mean(link, eta, alpha[:, [0]], alpha[:, [1]])
 
 
 def _predictive(trace: az.InferenceData) -> np.ndarray:
@@ -230,8 +238,11 @@ def sampler_diagnostics(
     ``var_names`` defaults to the parameters the fit reports; pass None to
     include every variable in the trace.
     """
+    if var_names:
+        # The stukel link's parameters exist only under that link.
+        var_names = [name for name in var_names if name in trace.posterior]
     per_parameter = az.summary(
-        trace, var_names=list(var_names) if var_names else None, kind="diagnostics"
+        trace, var_names=var_names or None, kind="diagnostics"
     ).rename_axis("parameter")
     per_parameter = per_parameter.sort_values("r_hat", ascending=False).reset_index()
 

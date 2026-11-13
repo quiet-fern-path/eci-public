@@ -36,6 +36,7 @@ from pymc.distributions.transforms import ZeroSumTransform
 from pymc.step_methods.hmc.quadpotential import QuadPotentialFull
 
 from .evaluation import evaluate_fit
+from .links import LINKS, STUKEL_PARAM, STUKEL_TAILS, link_mean
 
 # The anchor model names are matched against the "Model" column of the fit
 # input, i.e. the Airtable "Model aggregation" names. Renaming an aggregation
@@ -63,12 +64,17 @@ _CD_BOUND = 50.0
 # Variables checked for convergence after sampling.
 _DIAGNOSTIC_VARS = [
     "capability", "difficulty", "slope", "sigma",
-    "tau_alpha", "sigma_median", "tau_sigma",
+    "tau_alpha", "sigma_median", "tau_sigma", STUKEL_PARAM,
 ]
 
 # The free variables whose draws give the dense mass matrix and each chain's
-# starting point.
+# starting point; the stukel link adds its shape parameters to these.
 _FREE_VARS = ("tau_alpha", "sigma_median", "tau_sigma", "sigma", "capability", "difficulty", "log_slope")
+# Prior SD of the stukel link's shape parameters, centred on the logistic (0).
+_STUKEL_ALPHA_SD = 1.0
+# Spread given to those parameters around 0 when a logistic pilot stands in
+# for the stukel one.
+_STUKEL_PILOT_SD = 0.1
 # Posterior draws kept for that: enough to estimate the covariance of the ~460
 # unconstrained parameters.
 _COV_DRAWS = 2000
@@ -79,6 +85,9 @@ _COV_SHRINKAGE = 0.1
 # least this, and every r_hat at most _MAX_RHAT.
 _MIN_ESS = 400
 _MAX_RHAT = 1.01
+# NUTS's tree depth limit (PyMC's default). A move that reaches it was cut
+# short, which wastes gradient evaluations and signals a badly scaled sampler.
+_MAX_TREE_DEPTH = 10
 # The dense stage's tuning steps and draws per chain: its first run, and the
 # most draws it goes up to before falling back to the cold stage.
 _DENSE_TUNE = 500
@@ -185,6 +194,8 @@ def build_bayesian_model(
     df: pd.DataFrame,
     priors: BayesianPriors = BayesianPriors(),
     performance_clip_eps: float = 1e-3,
+    link: str = "logit",
+    capability_bound: float = _CD_BOUND,
 ) -> pm.Model:
     """
     Build the PyMC model, ready to sample from or inspect.
@@ -203,17 +214,30 @@ def build_bayesian_model(
             unbounded reward for pushing those rows' mu down, and the model
             pays for it by lowering the capability of the models involved and
             raising the sigma of the benchmarks carrying the zeros.
+        link: the curve mapping ``slope * (capability - difficulty)`` to the
+            mean score; one of :data:`eci.links.LINKS`. "stukel" adds two
+            shape parameters, ``link_alpha`` (one per tail, shared by every
+            benchmark), with a Normal(0, 1) prior centred on the logistic.
+        capability_bound: capabilities and difficulties are uniform on
+            [-capability_bound, capability_bound]. The default is flat
+            wherever the logistic fit puts them; a link with heavier tails
+            (cauchit, or stukel when it learns one) spreads capabilities
+            much further and may need a wider box.
 
     Returns:
         A ``pm.Model`` whose coordinates are the model and benchmark *names*
         (not the positional ids, which shift whenever the input data change).
     """
+    if link not in LINKS:
+        raise ValueError(f"unknown link {link!r}; choose one of {', '.join(LINKS)}")
     _, model_names, _, bench_names, model_idx, bench_idx = _index_data(df)
     if len(bench_names) < 2:
         raise ValueError("the fit needs at least two benchmarks")
     performance = _prepare_performance(df, performance_clip_eps)
 
     coords = {"model": model_names, "benchmark": bench_names}
+    if link == "stukel":
+        coords["tail"] = list(STUKEL_TAILS)
     with pm.Model(coords=coords) as model:
         tau_alpha = _lognormal("tau_alpha", priors.tau_alpha)
         sigma_median = _lognormal("sigma_median", priors.sigma_median)
@@ -230,7 +254,7 @@ def build_bayesian_model(
         kappa = pm.Deterministic("kappa", 1.0 / (4.0 * sigma**2) - 1.0, dims="benchmark")
 
         capability = pm.Uniform(
-            "capability", -_CD_BOUND, _CD_BOUND, dims="model"
+            "capability", -capability_bound, capability_bound, dims="model"
         )
         # Uniform on the sum-to-zero slice of the box. PyMC has no zero-sum
         # uniform, and Uniform with a ZeroSumTransform evaluates to nan, so the
@@ -243,7 +267,7 @@ def build_bayesian_model(
         pm.Potential(
             "difficulty_bound",
             pm.math.switch(
-                pm.math.all(pm.math.abs(difficulty) <= _CD_BOUND), 0.0, -np.inf
+                pm.math.all(pm.math.abs(difficulty) <= capability_bound), 0.0, -np.inf
             ),
         )
         # A sum-to-zero vector of length K has marginal SD sigma * sqrt(1 - 1/K);
@@ -255,7 +279,14 @@ def build_bayesian_model(
         slope = pm.Deterministic("slope", pm.math.exp(log_slope), dims="benchmark")
 
         eta = slope[bench_idx] * (capability[model_idx] - difficulty[bench_idx])
-        mu = pm.math.clip(pm.math.sigmoid(eta), _MU_EPS, 1.0 - _MU_EPS)
+        if link == "stukel":
+            alpha = pm.Normal(STUKEL_PARAM, 0.0, _STUKEL_ALPHA_SD, dims="tail")
+            mean = link_mean(link, eta, alpha[0], alpha[1], xp=pt)
+        elif link == "logit":
+            mean = pm.math.sigmoid(eta)
+        else:
+            mean = link_mean(link, eta, xp=pt)
+        mu = pm.math.clip(mean, _MU_EPS, 1.0 - _MU_EPS)
         kappa_obs = kappa[bench_idx]
         pm.Beta(
             "obs",
@@ -276,7 +307,7 @@ def _check_convergence(trace: az.InferenceData, max_rhat: float = _MAX_RHAT) -> 
             "Consider raising target_accept.",
             stacklevel=3,
         )
-    rhat = az.rhat(trace, var_names=_DIAGNOSTIC_VARS)
+    rhat = az.rhat(trace, var_names=_present(trace, _DIAGNOSTIC_VARS))
     worst = max(float(np.nanmax(v.to_numpy())) for v in rhat.data_vars.values())
     if worst > max_rhat:
         warnings.warn(
@@ -284,6 +315,12 @@ def _check_convergence(trace: az.InferenceData, max_rhat: float = _MAX_RHAT) -> 
             "Consider more tuning or draws.",
             stacklevel=3,
         )
+
+
+def _present(trace: az.InferenceData, names) -> list[str]:
+    """The ``names`` this trace's posterior has (the stukel link's parameters
+    exist only under that link)."""
+    return [name for name in names if name in trace.posterior]
 
 
 def _stack_draws(trace: az.InferenceData, name: str, dim: str) -> np.ndarray:
@@ -322,14 +359,14 @@ def _anchor_transform(
 
 
 def _thinned_draws(trace: az.InferenceData) -> dict:
-    """_COV_DRAWS evenly spaced draws of each of _FREE_VARS, chains pooled, as
+    """_COV_DRAWS evenly spaced draws of each free variable, chains pooled, as
     arrays of shape (n_draws,) or (n_draws, n_items)."""
     posterior = trace.posterior
     total = posterior.sizes["chain"] * posterior.sizes["draw"]
     keep = np.linspace(0, total - 1, min(_COV_DRAWS, total)).astype(int)
     return {
         v: posterior[v].stack(sample=("chain", "draw")).transpose("sample", ...).to_numpy()[keep]
-        for v in _FREE_VARS
+        for v in _present(trace, (*_FREE_VARS, STUKEL_PARAM))
     }
 
 
@@ -352,14 +389,17 @@ def _chain_starts(draws: dict, chains: int, rng) -> list[dict]:
     """A different draw per chain, so r_hat still compares chains that started
     in different places."""
     picks = rng.choice(len(draws["capability"]), chains, replace=False)
-    return [{v: draws[v][i] for v in _FREE_VARS} for i in picks]
+    return [{v: values[i] for v, values in draws.items()} for i in picks]
 
 
 def _diagnostics(trace: az.InferenceData) -> dict:
-    """Divergences, worst r_hat and lowest bulk ESS over _DIAGNOSTIC_VARS."""
-    rhat = az.rhat(trace, var_names=_DIAGNOSTIC_VARS)
-    ess = az.ess(trace, var_names=_DIAGNOSTIC_VARS)
+    """Divergences, worst r_hat and lowest bulk ESS over _DIAGNOSTIC_VARS, and
+    the share of moves that reached the tree depth limit."""
+    var_names = _present(trace, _DIAGNOSTIC_VARS)
+    rhat = az.rhat(trace, var_names=var_names)
+    ess = az.ess(trace, var_names=var_names)
     return {
+        "at_max_tree_depth": float((trace.sample_stats["tree_depth"] >= _MAX_TREE_DEPTH).mean()),
         "divergences": int(trace.sample_stats["diverging"].sum()),
         "max_rhat": max(float(np.nanmax(v.to_numpy())) for v in rhat.data_vars.values()),
         "min_ess": min(float(np.nanmin(v.to_numpy())) for v in ess.data_vars.values()),
@@ -410,12 +450,20 @@ def _sample(
     progressbar: bool,
     dense_mass_matrix: bool,
     sample_kwargs: dict,
+    pilot_model: "pm.Model | None" = None,
 ) -> tuple[az.InferenceData, str, list[dict]]:
     """Sample the model, trying each stage until one passes the checks.
 
     First "pilot", with a dense mass matrix from a short diagonal run's
     draws, then "cold", with the diagonal mass matrix. Returns the trace, the stage it came from, and
     one dict per run (stage, tune, draws, divergences, max_rhat, min_ess).
+
+    ``pilot_model`` is the logistic model the stukel link's pilot runs on
+    instead: the diagonal sampler cannot cope with that link's two shape
+    parameters (it runs every move to the tree depth limit), and the logistic
+    fit is the stukel fit at ``link_alpha = 0``. The pilot's draws then start
+    a short dense "warm-up" run of the stukel model itself, whose draws give
+    the covariance and starting points the main dense run uses.
     """
     common = dict(chains=chains, cores=chains, progressbar=progressbar,
                   compute_convergence_checks=False, **sample_kwargs)
@@ -424,9 +472,8 @@ def _sample(
     def draws_range(default):
         return default if draws is None else (draws, draws)
 
-    def dense_stage(source, label, seed):
+    def dense_stage(cov_draws, label, seed):
         rng = np.random.default_rng(seed)
-        cov_draws = _thinned_draws(source)
         cov = _dense_cov(model, cov_draws)
         dense_tune = _DENSE_TUNE if tune is None else tune
 
@@ -442,10 +489,51 @@ def _sample(
     if dense_mass_matrix:
         # Pilot: a short run with the default diagonal mass matrix, only to
         # estimate the covariance and starting points for a dense run.
-        with model:
+        with pilot_model or model:
             pilot = pm.sample(draws=_PILOT_DRAWS, tune=_PILOT_TUNE, target_accept=target_accept,
                               random_seed=random_seed + 1, **common)
-        trace, passed = dense_stage(pilot, "pilot", random_seed + 200)
+        cov_draws = _thinned_draws(pilot)
+        if pilot_model is not None:
+            # The logistic pilot has no shape parameters: give them a narrow
+            # spread around the logistic's 0, then let a short dense run of
+            # the real model find where they and everything else sit.
+            rng = np.random.default_rng(random_seed + 100)
+            cov_draws[STUKEL_PARAM] = rng.normal(
+                0.0, _STUKEL_PILOT_SD, (len(cov_draws["capability"]), len(STUKEL_TAILS))
+            )
+            dense_tune = _DENSE_TUNE if tune is None else tune
+            with model:
+                step = pm.NUTS(potential=QuadPotentialFull(_dense_cov(model, cov_draws)),
+                               target_accept=target_accept)
+                warm_up = pm.sample(draws=_PILOT_DRAWS, tune=dense_tune, step=step,
+                                    initvals=_chain_starts(cov_draws, chains, rng),
+                                    random_seed=random_seed + 100, **common)
+            attempts.append({"stage": "warm-up", "tune": dense_tune, "draws": _PILOT_DRAWS,
+                             **_diagnostics(warm_up)})
+            cov_draws = _thinned_draws(warm_up)
+        trace, passed = dense_stage(cov_draws, "pilot", random_seed + 200)
+        if passed and attempts[-1]["at_max_tree_depth"] > 0:
+            # The draws mixed, but with moves cut short at the tree depth
+            # limit: the pilot's covariance was a poor guide (a pilot that
+            # diverged, say). Re-estimate it from these better draws and
+            # sample again.
+            refreshed, refreshed_passed = dense_stage(
+                _thinned_draws(trace), "refresh", random_seed + 300
+            )
+            if refreshed_passed:
+                trace = refreshed
+                if attempts[-1]["at_max_tree_depth"] > 0:
+                    warnings.warn(
+                        f"{attempts[-1]['at_max_tree_depth']:.1%} of moves still reach the "
+                        "tree depth limit after refreshing the mass matrix.",
+                        stacklevel=3,
+                    )
+                return trace, "refresh", attempts
+            warnings.warn(
+                "The dense fit's moves reach the tree depth limit and refreshing the "
+                "mass matrix did not give a passing fit; keeping the first.",
+                stacklevel=3,
+            )
         if passed:
             return trace, "pilot", attempts
         last = attempts[-1]
@@ -478,6 +566,8 @@ def fit_bayesian_eci(
     target_accept: float = 0.95,
     random_seed: int = 12345,
     *,
+    link: str = "logit",
+    capability_bound: float = _CD_BOUND,
     dense_mass_matrix: bool = True,
     anchor_model_low: str = DEFAULT_ANCHOR_MODEL_LOW,
     anchor_eci_low: float = DEFAULT_ANCHOR_ECI_LOW,
@@ -512,6 +602,12 @@ def fit_bayesian_eci(
         target_accept: NUTS target acceptance rate.
         random_seed: seed for the sampler; later runs use seeds derived
             from it.
+        link: the curve mapping ``slope * (capability - difficulty)`` to the
+            mean score: "logit" (the default), "probit", "cauchit",
+            "cloglog", "loglog" or "stukel"; see :mod:`eci.links`. The link is
+            recorded in the trace as ``trace.posterior.attrs["link"]``.
+        capability_bound: half-width of the uniform prior on capabilities
+            and difficulties; see :func:`build_bayesian_model`.
         dense_mass_matrix: sample with a dense mass matrix first, the
             covariance of a short diagonal pilot run (tune 1000 + draws
             1000), whose draws also give each chain's starting point. If that
@@ -551,7 +647,8 @@ def fit_bayesian_eci(
           sigma,
           the per-draw map coefficients a and b, trace, the full
           ``arviz.InferenceData``, started_from (the stage the draws came
-          from: "pilot" or "cold"), attempts
+          from: "pilot", "refresh" - a second dense run, made when the first
+          mixed but hit the tree depth limit - or "cold"), attempts
           (one dict per run: stage, tune, draws, divergences, max_rhat,
           min_ess), and - with evaluate=True - evaluation, the dict of
           diagnostic tables.
@@ -569,13 +666,19 @@ def fit_bayesian_eci(
 
     sample_kwargs = dict(sampler_kwargs or {})
 
-    pymc_model = build_bayesian_model(df, priors, performance_clip_eps)
+    pymc_model = build_bayesian_model(df, priors, performance_clip_eps, link, capability_bound)
     trace, started_from, attempts = _sample(
         pymc_model,
         draws=draws, tune=tune, chains=chains, target_accept=target_accept,
         random_seed=random_seed, progressbar=progressbar,
         dense_mass_matrix=dense_mass_matrix, sample_kwargs=sample_kwargs,
+        pilot_model=(
+            build_bayesian_model(df, priors, performance_clip_eps, "logit", capability_bound)
+            if link == "stukel" else None
+        ),
     )
+    # The evaluation reads the link back from here to rebuild the fitted curve.
+    trace.posterior.attrs["link"] = link
     with pymc_model:
         if evaluate:
             # LOO needs the pointwise log likelihood, which PyMC does not
@@ -621,6 +724,8 @@ def fit_bayesian_eci(
         "trace": trace,
         "started_from": started_from,
         "attempts": attempts,
+        "link": link,
+        "capability_bound": capability_bound,
     }
     if evaluate:
         draws_out["evaluation"] = evaluate_fit(

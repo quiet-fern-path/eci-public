@@ -64,6 +64,10 @@ python scripts/fit_eci.py --draws 8000 --chains 4
 # Also write the diagnostic suite to outputs/evaluation/
 python scripts/fit_eci.py --evaluate
 
+# Also save the full trace to outputs/trace/, for rerunning predictive checks
+# and PSIS-LOO later (implies --evaluate)
+python scripts/fit_eci.py --save-trace
+
 # Fit by frequentist approach (least squares error) instead
 python scripts/fit_eci.py --method least-squares
 
@@ -187,6 +191,35 @@ priors = BayesianPriors(sigma_median=(np.log(0.07), 0.5))
 eci_df, edi_df, draws = fit_bayesian_eci(df, priors=priors)
 ```
 
+### Alternative link functions
+
+The logistic curve is the default link. `link=` (or `--link`) swaps it for
+another curve from 0 to 1, keeping the rest of the model unchanged:
+
+| Link | Mean score at `eta = slope * (capability - difficulty)` |
+| --- | --- |
+| `logit` | `1 / (1 + exp(-eta))` |
+| `probit` | standard normal CDF; thinner tails |
+| `cauchit` | standard Cauchy CDF; much heavier tails |
+| `cloglog` | `1 - exp(-exp(eta))`; reaches 1 fast and 0 slowly |
+| `loglog` | `exp(-exp(-eta))`; the mirror image |
+| `stukel` | Stukel's (1988) generalised logistic, with two learned shape parameters `link_alpha` (one per tail, shared by every benchmark, prior `Normal(0, 1)`); 0 is the logistic, negative fattens that tail, positive thins it |
+
+Heavier-tailed links spread capabilities much further on the raw scale, so the
+`Uniform(-50, 50)` prior can start to bind; `capability_bound=` (or
+`--capability-bound`) widens it. The stukel link's pilot runs on the logistic
+model, which it nests, followed by a short dense warm-up run.
+
+`scripts/compare_links.py` compares fits saved with `--save-trace` by PSIS-LOO:
+the sampling checks, ELPD and its paired difference from a reference fit, and
+leave-one-out calibration plots.
+
+```bash
+python scripts/fit_eci.py --save-trace
+python scripts/fit_eci.py --link probit --save-trace --output-dir outputs/links/probit
+python scripts/compare_links.py logit=outputs/trace probit=outputs/links/probit/trace
+```
+
 ### Sampling
 
 The sampler runs 4 chains, each on its own core, at `target_accept=0.95`,
@@ -203,8 +236,11 @@ so r_hat stays meaningful. The dense run then tunes for 500 steps.
 
 If the dense run diverges or still misses the convergence checks (bulk ESS
 below 400 or r_hat above 1.01) at 16,000 draws, the fit falls back to the
-default diagonal sampler, with a warning. `draws["started_from"]` says
-whether the draws came from the "pilot" or the "cold" stage.
+default diagonal sampler, with a warning. If the dense run passes but
+any of its moves reach the tree depth limit of 10, the covariance is
+re-estimated from its draws and the run repeated (the "refresh" stage).
+`draws["started_from"]` says whether the draws came from the "pilot",
+"refresh" or "cold" stage.
 `dense_mass_matrix=False` goes straight to PyMC's default sampler (1000
 tuning steps, from 4000 up to 32,000 draws per chain), which needs about
 12,000 draws on the full data where the dense one needs 1000.
@@ -256,6 +292,25 @@ dataset per posterior draw, both of which are (draws × observations) arrays,
 so the fit uses more memory and time. The per-observation metrics thin to
 `evaluation_max_draws` (2000 by default); the sampler diagnostics always use
 every draw.
+
+`--save-trace` writes what those checks need to `<output-dir>/trace/`, so they
+can be rerun, or done in another tool such as R's `loo`, without refitting:
+
+| File | Contents |
+| --- | --- |
+| `trace.nc` | NetCDF, one group each: `posterior`, `sample_stats`, `log_likelihood` (chain × draw × observation, for PSIS-LOO), `posterior_predictive` (one replicated dataset per draw) and `observed_data` (the clipped scores) |
+| `fit_data.csv` | The fitted rows in observation order: row `i` is observation `i` of the arrays above |
+| `run_info.json` | Sampler settings, each run's diagnostics, anchors and package versions |
+
+Every draw of every chain is kept (about 200 MB on the published data), and the
+chain dimension gives PSIS-LOO its relative effective sample sizes.
+
+```python
+import arviz as az, xarray as xr
+
+trace = xr.open_datatree("outputs/trace/trace.nc")
+print(az.loo(trace, pointwise=True))
+```
 
 `build_bayesian_model(df)` returns the `pm.Model` itself if you want to sample
 it differently or inspect it. Divergences and poor mixing are reported as

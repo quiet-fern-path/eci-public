@@ -35,6 +35,9 @@ dependencies = [
     # arviz>=1.0 made matplotlib an optional plotting backend rather than a
     # hard dependency; eci.evaluation imports it directly for the PDF report.
     "matplotlib>=3.5",
+    # Backend for writing the trace to NetCDF (fit_eci.py --save-trace).
+    "h5netcdf>=1.3",
+    "h5py>=3.8",
 ]
 
 [project.optional-dependencies]

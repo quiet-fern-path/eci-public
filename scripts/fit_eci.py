@@ -9,15 +9,24 @@ Usage:
     python scripts/fit_eci.py
     python scripts/fit_eci.py --input path/to/benchmark_data.zip
     python scripts/fit_eci.py --evaluate
+    python scripts/fit_eci.py --save-trace
     python scripts/fit_eci.py --method least-squares
 """
 
 import argparse
+import json
+import platform
+from datetime import datetime, timezone
+from importlib.metadata import version
 from pathlib import Path
 
 import pandas as pd
 
 from eci import (
+    DEFAULT_ANCHOR_ECI_HIGH,
+    DEFAULT_ANCHOR_ECI_LOW,
+    DEFAULT_ANCHOR_MODEL_HIGH,
+    DEFAULT_ANCHOR_MODEL_LOW,
     fit_bayesian_eci,
     fit_eci_model,
     prepare_benchmark_data,
@@ -25,6 +34,7 @@ from eci import (
     summarise_evaluation,
 )
 from eci.dataloader import BENCHMARK_DATA_URL
+from eci.links import LINKS
 
 
 OUTPUT_DIR = Path(__file__).parent.parent / "outputs"
@@ -35,6 +45,55 @@ MODEL_METADATA_COLS = ["date", "Organization", "model_version", "source"]
 
 # Per-benchmark columns written out, in order, when the fit produces them
 EDI_VALUE_COLS = ["edi", "discriminability_scaled", "sigma"]
+
+# Packages whose versions are recorded next to a saved trace
+RECORDED_PACKAGES = ["eci", "pymc", "pytensor", "arviz", "numpy", "scipy", "pandas", "xarray"]
+
+
+def save_trace(draws: dict, df: pd.DataFrame, args, output_dir: Path) -> list[Path]:
+    """Write everything predictive checks and PSIS-LOO need to ``output_dir``.
+
+    - trace.nc: the full trace, every draw of every chain. Its groups are
+      posterior, sample_stats, log_likelihood (the pointwise log likelihood
+      PSIS-LOO reweights), posterior_predictive (one replicated dataset per
+      draw) and observed_data (the clipped scores the likelihood saw).
+    - fit_data.csv: the fitted rows in the trace's observation order, so row
+      i is observation i of the pointwise arrays.
+    - run_info.json: the sampler settings, each run's diagnostics, the anchor
+      models and package versions.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = output_dir / "trace.nc"
+    draws["trace"].to_netcdf(trace_path)
+
+    data_path = output_dir / "fit_data.csv"
+    df.reset_index(drop=True).rename_axis("obs").to_csv(data_path)
+
+    posterior = draws["trace"].posterior
+    info = {
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "input": str(args.input),
+        "n_observations": len(df),
+        "n_models": len(draws["model_names"]),
+        "n_benchmarks": len(draws["benchmark_names"]),
+        "chains": int(posterior.sizes["chain"]),
+        "draws_per_chain": int(posterior.sizes["draw"]),
+        "target_accept": args.target_accept,
+        "seed": args.seed,
+        "link": draws["link"],
+        "capability_bound": draws["capability_bound"],
+        "started_from": draws["started_from"],
+        "attempts": draws["attempts"],
+        "anchors": {
+            DEFAULT_ANCHOR_MODEL_LOW: DEFAULT_ANCHOR_ECI_LOW,
+            DEFAULT_ANCHOR_MODEL_HIGH: DEFAULT_ANCHOR_ECI_HIGH,
+        },
+        "python": platform.python_version(),
+        "packages": {name: version(name) for name in RECORDED_PACKAGES},
+    }
+    info_path = output_dir / "run_info.json"
+    info_path.write_text(json.dumps(info, indent=2) + "\n")
+    return [trace_path, data_path, info_path]
 
 
 def join_model_metadata(eci_df: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
@@ -91,11 +150,29 @@ def main():
         "--seed", type=int, default=12345, help="Sampler seed (default: 12345)",
     )
     bayesian.add_argument(
+        "--link", choices=LINKS, default="logit",
+        help="Curve mapping discriminability * (capability - difficulty) to "
+             "the mean score; stukel learns two tail-shape parameters "
+             "(default: logit)",
+    )
+    bayesian.add_argument(
+        "--capability-bound", type=float, default=50.0,
+        help="Capabilities and difficulties are uniform on [-bound, bound] "
+             "on the raw scale; heavier-tailed links may need more (default: 50)",
+    )
+    bayesian.add_argument(
         "--evaluate",
         action="store_true",
         help="Run the diagnostic suite (convergence, accuracy, LOO, "
              "calibration, posterior predictive checks) alongside the fit"
              "and write it as a PDF report to <output-dir>/evaluation/",
+    )
+    bayesian.add_argument(
+        "--save-trace",
+        action="store_true",
+        help="Save the full trace, with the pointwise log likelihood and "
+             "posterior predictive draws, to <output-dir>/trace/ so predictive "
+             "checks and PSIS-LOO can be rerun later. Implies --evaluate",
     )
 
     least_squares = parser.add_argument_group("least-squares options")
@@ -112,6 +189,9 @@ def main():
     )
 
     args = parser.parse_args()
+    # The pointwise log likelihood and the replicated datasets are only
+    # computed for the evaluation
+    args.evaluate = args.evaluate or args.save_trace
 
     if args.evaluate and args.method != "bayesian":
         parser.error(
@@ -125,7 +205,7 @@ def main():
     print(f"  {df['model_id'].nunique()} models, {df['benchmark_id'].nunique()} benchmarks")
 
     if args.method == "bayesian":
-        print(f"\nFitting Bayesian IRT model ({args.chains} chains, "
+        print(f"\nFitting Bayesian IRT model ({args.link} link, {args.chains} chains, "
               f"{args.draws or 'adaptive'} draws, {args.tune or 'default'} tuning steps)...")
         eci_df, edi_df, draws = fit_bayesian_eci(
             df,
@@ -134,6 +214,8 @@ def main():
             chains=args.chains,
             target_accept=args.target_accept,
             random_seed=args.seed,
+            link=args.link,
+            capability_bound=args.capability_bound,
             evaluate=args.evaluate,
         )
     else:
@@ -187,6 +269,10 @@ def main():
             print(f"\nSaved evaluation report to {path}")
         print("\n=== Evaluation ===")
         print(summarise_evaluation(evaluation))
+
+    if args.method == "bayesian" and args.save_trace:
+        for path in save_trace(draws, df, args, args.output_dir / "trace"):
+            print(f"Saved {path}")
 
     # Print summary
     print("\n=== Top 10 Models by ECI ===")
